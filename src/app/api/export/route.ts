@@ -3,12 +3,12 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import fs from "fs/promises";
 import { getJobUploadDir, sanitizeFilename } from "@/lib/storage/paths";
-import { getRandomColorBackgrounds } from "@/lib/storage/colors";
+import { getRandomColorBackgrounds, getAvailableColorBackgrounds } from "@/lib/storage/colors";
 import { createJobZipStream } from "@/lib/zip/generator";
 import { exportModeSchema, outputFormatSchema, MAX_FILE_SIZE_BYTES } from "@/lib/validation/job";
 import { JobProductConfig, ExportMode, OutputFormat } from "@/types";
 
-export const maxDuration = 60; // 60 seconds Vercel Serverless Function timeout limit
+export const maxDuration = 60; // Max duration setting
 
 export async function POST(req: NextRequest) {
   try {
@@ -17,6 +17,7 @@ export async function POST(req: NextRequest) {
     const exportModeRaw = formData.get("exportMode") as string;
     const outputFormatRaw = (formData.get("outputFormat") as string) || "jpeg";
     const backgroundCountRaw = formData.get("backgroundCount") as string;
+    const backgroundStartIndexRaw = (formData.get("backgroundStartIndex") as string) || "0";
     const settingsRaw = formData.get("productSettings") as string;
 
     if (!exportModeRaw || !backgroundCountRaw || !settingsRaw) {
@@ -29,6 +30,8 @@ export async function POST(req: NextRequest) {
     const exportMode = exportModeSchema.parse(exportModeRaw) as ExportMode;
     const outputFormat = outputFormatSchema.parse(outputFormatRaw) as OutputFormat;
     const backgroundCount = parseInt(backgroundCountRaw, 10);
+    const backgroundStartIndex = parseInt(backgroundStartIndexRaw, 10);
+
     const parsedSettings: Array<{ id: string; originalFilename: string; replaceBackground: boolean }> =
       JSON.parse(settingsRaw);
 
@@ -79,17 +82,21 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const selectedBackgrounds = getRandomColorBackgrounds(backgroundCount);
+    // Draw background chunk starting at backgroundStartIndex
+    const allColors = getAvailableColorBackgrounds(2000);
+    const chunkColors = allColors.slice(
+      backgroundStartIndex,
+      backgroundStartIndex + backgroundCount
+    );
 
     const { stream, promise } = createJobZipStream({
       jobId,
       products: jobProducts,
-      backgrounds: selectedBackgrounds,
+      backgrounds: chunkColors,
       exportMode,
       outputFormat,
     });
 
-    // Clean up temporary uploads when streaming completes
     promise.finally(async () => {
       try {
         await fs.rm(jobUploadDir, { recursive: true, force: true });
@@ -98,7 +105,6 @@ export async function POST(req: NextRequest) {
       }
     });
 
-    // Convert PassThrough Node stream to Web ReadableStream
     const readableStream = new ReadableStream({
       start(controller) {
         stream.on("data", (chunk) => controller.enqueue(chunk));
@@ -111,7 +117,7 @@ export async function POST(req: NextRequest) {
     headers.set("Content-Type", "application/zip");
     headers.set(
       "Content-Disposition",
-      `attachment; filename="product-export-${jobId.slice(0, 8)}.zip"`
+      `attachment; filename="chunk-${backgroundStartIndex}-${jobId.slice(0, 8)}.zip"`
     );
 
     return new NextResponse(readableStream, {
