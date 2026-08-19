@@ -66,7 +66,7 @@ function getFormatExtension(format: OutputFormat = "jpeg"): string {
 
 /**
  * Creates an in-memory PassThrough stream and pipes the generated Archiver ZIP.
- * Optimized for Vercel Serverless Functions with zero disk write dependency.
+ * Guarantees clean ZIP footer finalization to prevent corrupted archives.
  */
 export function createJobZipStream(options: Omit<ZipGeneratorOptions, "outputPath">): {
   stream: PassThrough;
@@ -90,110 +90,110 @@ export function createJobZipStream(options: Omit<ZipGeneratorOptions, "outputPat
   archive.pipe(passThrough);
 
   const promise = (async () => {
-    onProgress?.(0, totalTasks, "Pre-processing product images...");
+    try {
+      onProgress?.(0, totalTasks, "Pre-processing product images...");
 
-    const preparedProductsMap = new Map<string, PreparedProduct>();
-    const originalBuffersMap = new Map<string, Buffer>();
+      const preparedProductsMap = new Map<string, PreparedProduct>();
+      const originalBuffersMap = new Map<string, Buffer>();
 
-    for (const prod of products) {
-      if (prod.replaceBackground) {
-        const prepared = await prepareResizedProduct(prod.tempFilePath);
-        preparedProductsMap.set(prod.id, prepared);
+      for (const prod of products) {
+        if (prod.replaceBackground) {
+          const prepared = await prepareResizedProduct(prod.tempFilePath);
+          preparedProductsMap.set(prod.id, prepared);
+        }
+        if (!prod.replaceBackground || exportMode === "background_wise") {
+          const buf = await fsPromises.readFile(prod.tempFilePath);
+          originalBuffersMap.set(prod.id, buf);
+        }
       }
-      if (!prod.replaceBackground || exportMode === "background_wise") {
-        const buf = await fsPromises.readFile(prod.tempFilePath);
-        originalBuffersMap.set(prod.id, buf);
-      }
-    }
 
-    const CONCURRENCY_BATCH_SIZE = 24;
+      const CONCURRENCY_BATCH_SIZE = 32; // 32 parallel workers with threadpool 64
 
-    if (exportMode === "background_wise") {
-      for (const bg of backgrounds) {
-        const folderName = bg.name;
+      if (exportMode === "background_wise") {
+        for (const bg of backgrounds) {
+          const folderName = bg.name;
 
-        await processInBatches(products, CONCURRENCY_BATCH_SIZE, async (prod) => {
-          const safeName = sanitizeFilename(prod.originalFilename);
-          const baseName = path.parse(safeName).name;
+          await processInBatches(products, CONCURRENCY_BATCH_SIZE, async (prod) => {
+            const safeName = sanitizeFilename(prod.originalFilename);
+            const baseName = path.parse(safeName).name;
 
-          const zipEntryPath = prod.replaceBackground
-            ? `${folderName}/${baseName}${targetExt}`
-            : `${folderName}/${safeName}`;
+            const zipEntryPath = prod.replaceBackground
+              ? `${folderName}/${baseName}${targetExt}`
+              : `${folderName}/${safeName}`;
 
-          if (prod.replaceBackground) {
+            if (prod.replaceBackground) {
+              const prepared = preparedProductsMap.get(prod.id)!;
+              const generatedBuffer = await compositeProductOnColorBackground(
+                prepared,
+                bg,
+                outputFormat
+              );
+              archive.append(generatedBuffer, { name: zipEntryPath });
+            } else {
+              const origBuf = originalBuffersMap.get(prod.id)!;
+              archive.append(origBuf, { name: zipEntryPath });
+            }
+
+            completedTasks++;
+            onProgress?.(
+              completedTasks,
+              totalTasks,
+              `Processed ${prod.originalFilename} → ${folderName}`
+            );
+          });
+        }
+      } else {
+        const targetFolder = "Generated Images";
+
+        for (const prod of products) {
+          if (!prod.replaceBackground) {
+            const safeName = sanitizeFilename(prod.originalFilename);
+            const ext = path.extname(safeName);
+            const base = path.basename(safeName, ext);
+            const originalZipEntry = `${targetFolder}/${base}_original${ext || ".png"}`;
+
+            const origBuf = originalBuffersMap.get(prod.id)!;
+            archive.append(origBuf, { name: originalZipEntry });
+
+            completedTasks++;
+            onProgress?.(completedTasks, totalTasks, `Added ${originalZipEntry}`);
+          }
+        }
+
+        for (const bg of backgrounds) {
+          const bgBase = bg.name;
+          const enabledProducts = products.filter((p) => p.replaceBackground);
+
+          await processInBatches(enabledProducts, CONCURRENCY_BATCH_SIZE, async (prod) => {
+            const safeName = sanitizeFilename(prod.originalFilename);
+            const base = path.parse(safeName).name;
+
+            const imageFileName = `${base}_${bgBase}${targetExt}`;
+            const zipEntryPath = `${targetFolder}/${imageFileName}`;
+
             const prepared = preparedProductsMap.get(prod.id)!;
             const generatedBuffer = await compositeProductOnColorBackground(
               prepared,
               bg,
               outputFormat
             );
+
             archive.append(generatedBuffer, { name: zipEntryPath });
-          } else {
-            const origBuf = originalBuffersMap.get(prod.id)!;
-            archive.append(origBuf, { name: zipEntryPath });
-          }
 
-          completedTasks++;
-          onProgress?.(
-            completedTasks,
-            totalTasks,
-            `Processed ${prod.originalFilename} → ${folderName}`
-          );
-        });
-      }
-    } else {
-      const targetFolder = "Generated Images";
-
-      for (const prod of products) {
-        if (!prod.replaceBackground) {
-          const safeName = sanitizeFilename(prod.originalFilename);
-          const ext = path.extname(safeName);
-          const base = path.basename(safeName, ext);
-          const originalZipEntry = `${targetFolder}/${base}_original${ext || ".png"}`;
-
-          const origBuf = originalBuffersMap.get(prod.id)!;
-          archive.append(origBuf, { name: originalZipEntry });
-
-          completedTasks++;
-          onProgress?.(completedTasks, totalTasks, `Added ${originalZipEntry}`);
+            completedTasks++;
+            onProgress?.(completedTasks, totalTasks, `Processed ${imageFileName}`);
+          });
         }
       }
-
-      for (const bg of backgrounds) {
-        const bgBase = bg.name;
-        const enabledProducts = products.filter((p) => p.replaceBackground);
-
-        await processInBatches(enabledProducts, CONCURRENCY_BATCH_SIZE, async (prod) => {
-          const safeName = sanitizeFilename(prod.originalFilename);
-          const base = path.parse(safeName).name;
-
-          const imageFileName = `${base}_${bgBase}${targetExt}`;
-          const zipEntryPath = `${targetFolder}/${imageFileName}`;
-
-          const prepared = preparedProductsMap.get(prod.id)!;
-          const generatedBuffer = await compositeProductOnColorBackground(
-            prepared,
-            bg,
-            outputFormat
-          );
-
-          archive.append(generatedBuffer, { name: zipEntryPath });
-
-          completedTasks++;
-          onProgress?.(completedTasks, totalTasks, `Processed ${imageFileName}`);
-        });
-      }
+    } finally {
+      // Guarantee ZIP footer finalization so archive is never left corrupt
+      await archive.finalize();
     }
-
-    await archive.finalize();
   })();
 
   return { stream: passThrough, promise };
 }
 
-/**
- * File-based ZIP generator for local filesystem runs.
- */
 export async function generateJobZip(options: ZipGeneratorOptions): Promise<void> {
   if (!options.outputPath) {
     throw new Error("outputPath is required for generateJobZip");
