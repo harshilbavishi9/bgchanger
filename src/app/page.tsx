@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect } from "react";
 import { v4 as uuidv4 } from "uuid";
 import { Header } from "@/components/Header";
 import { Dropzone } from "@/components/upload/Dropzone";
@@ -15,16 +15,15 @@ import { ArrowRight, AlertTriangle } from "lucide-react";
 export default function HomePage() {
   const [products, setProducts] = useState<ProductItem[]>([]);
   const [exportMode, setExportMode] = useState<ExportMode>("background_wise");
-  const [outputFormat, setOutputFormat] = useState<OutputFormat>("jpeg"); // Default JPEG for instant speed!
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>("jpeg");
   const [backgroundCount, setBackgroundCount] = useState<number>(100);
   const [maxAvailableBackgrounds, setMaxAvailableBackgrounds] = useState<number>(2000);
   const [sampleColors, setSampleColors] = useState<ColorBackground[]>([]);
 
   const [job, setJob] = useState<JobStatus | null>(null);
+  const [downloadBlobUrl, setDownloadBlobUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
-
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     async function fetchBackgrounds() {
@@ -51,8 +50,9 @@ export default function HomePage() {
       products.forEach((p) => {
         if (p.previewUrl) URL.revokeObjectURL(p.previewUrl);
       });
+      if (downloadBlobUrl) URL.revokeObjectURL(downloadBlobUrl);
     };
-  }, [products]);
+  }, [products, downloadBlobUrl]);
 
   const handleFilesSelected = (newFiles: File[]) => {
     setError(null);
@@ -86,6 +86,7 @@ export default function HomePage() {
     });
   };
 
+  // Direct Vercel Serverless Direct Stream Export
   const handleStartGeneration = async () => {
     if (products.length === 0) {
       setError("Please upload at least one product image.");
@@ -94,6 +95,24 @@ export default function HomePage() {
 
     setError(null);
     setIsSubmitting(true);
+    const jobId = uuidv4();
+
+    // Set active progress view
+    const initialJob: JobStatus = {
+      id: jobId,
+      status: "processing",
+      total: backgroundCount * products.length,
+      completed: Math.round((backgroundCount * products.length) * 0.5),
+      progress: 45,
+      createdAt: Date.now(),
+      exportMode,
+      outputFormat,
+      backgroundCount,
+      totalProducts: products.length,
+      currentOperation: "Generating & streaming ZIP package in real-time...",
+    };
+
+    setJob(initialJob);
 
     try {
       const formData = new FormData();
@@ -115,49 +134,55 @@ export default function HomePage() {
         }
       });
 
-      const res = await fetch("/api/jobs", {
+      const res = await fetch("/api/export", {
         method: "POST",
         body: formData,
       });
 
       if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || "Failed to create processing job.");
+        let errMsg = "Direct stream export failed.";
+        try {
+          const errData = await res.json();
+          errMsg = errData.error || errMsg;
+        } catch {
+          // Ignored
+        }
+        throw new Error(errMsg);
       }
 
-      const initialJobStatus: JobStatus = await res.json();
-      setJob(initialJobStatus);
-      startPolling(initialJobStatus.id);
+      // Stream blob response directly
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      setDownloadBlobUrl(blobUrl);
+
+      // Trigger instant browser download
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `product-export-${jobId.slice(0, 8)}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      setJob({
+        ...initialJob,
+        status: "completed",
+        progress: 100,
+        completed: initialJob.total,
+        downloadUrl: blobUrl,
+        currentOperation: "Export package generated and downloaded successfully.",
+      });
     } catch (err) {
-      console.error("Job creation error:", err);
+      console.error("Vercel stream export error:", err);
       setError(err instanceof Error ? err.message : "Export generation failed.");
+      setJob(null);
     } finally {
       setIsSubmitting(false);
     }
   };
 
-  const startPolling = (jobId: string) => {
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-
-    pollIntervalRef.current = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/jobs/${jobId}`);
-        if (res.ok) {
-          const updatedJob: JobStatus = await res.json();
-          setJob(updatedJob);
-
-          if (updatedJob.status === "completed" || updatedJob.status === "failed") {
-            if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-          }
-        }
-      } catch (err) {
-        console.warn("Polling error:", err);
-      }
-    }, 200); // Polling every 200ms for instant UI updates
-  };
-
   const handleReset = () => {
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    if (downloadBlobUrl) URL.revokeObjectURL(downloadBlobUrl);
+    setDownloadBlobUrl(null);
     setJob(null);
     setError(null);
   };
@@ -172,7 +197,7 @@ export default function HomePage() {
       <main className="flex-1 max-w-6xl w-full mx-auto px-6 py-8">
         {job && job.status === "completed" ? (
           <CompleteView job={job} onReset={handleReset} />
-        ) : job && (job.status === "queued" || job.status === "processing") ? (
+        ) : job && job.status === "processing" ? (
           <ProgressView job={job} />
         ) : (
           <div className="space-y-8">
@@ -194,7 +219,7 @@ export default function HomePage() {
                   className="shadow-sm"
                 >
                   {isSubmitting ? (
-                    "Starting Export..."
+                    "Generating ZIP..."
                   ) : (
                     <>
                       <span>Start Generation</span>
@@ -271,7 +296,7 @@ export default function HomePage() {
                   className="shadow-sm"
                 >
                   {isSubmitting ? (
-                    "Starting Export..."
+                    "Generating ZIP..."
                   ) : (
                     <>
                       <span>Start Generation</span>

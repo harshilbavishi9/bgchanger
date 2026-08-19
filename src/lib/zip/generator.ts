@@ -2,6 +2,7 @@ import archiver from "archiver";
 import fs from "fs";
 import fsPromises from "fs/promises";
 import path from "path";
+import { PassThrough } from "stream";
 import { prepareResizedProduct, compositeProductOnColorBackground, PreparedProduct } from "../image/processor";
 import { ColorBackground } from "../storage/colors";
 import { JobProductConfig, ExportMode, OutputFormat } from "../../types";
@@ -9,7 +10,7 @@ import { sanitizeFilename } from "../storage/paths";
 
 export interface ZipGeneratorOptions {
   jobId: string;
-  outputPath: string;
+  outputPath?: string;
   products: JobProductConfig[];
   backgrounds: ColorBackground[];
   exportMode: ExportMode;
@@ -17,9 +18,6 @@ export interface ZipGeneratorOptions {
   onProgress?: (completed: number, total: number, currentOp: string) => void;
 }
 
-/**
- * Calculate total output image files to be produced.
- */
 export function calculateTotalTaskCount(
   products: JobProductConfig[],
   backgrounds: ColorBackground[],
@@ -40,9 +38,6 @@ export function calculateTotalTaskCount(
   }
 }
 
-/**
- * Helper to process array items in concurrent parallel batches.
- */
 async function processInBatches<T, R>(
   items: T[],
   batchSize: number,
@@ -70,12 +65,14 @@ function getFormatExtension(format: OutputFormat = "jpeg"): string {
 }
 
 /**
- * Instant ZIP archive generator using store mode (level 0), hardware-accelerated image formats,
- * and 24-worker parallel execution.
+ * Creates an in-memory PassThrough stream and pipes the generated Archiver ZIP.
+ * Optimized for Vercel Serverless Functions with zero disk write dependency.
  */
-export async function generateJobZip(options: ZipGeneratorOptions): Promise<void> {
+export function createJobZipStream(options: Omit<ZipGeneratorOptions, "outputPath">): {
+  stream: PassThrough;
+  promise: Promise<void>;
+} {
   const {
-    outputPath,
     products,
     backgrounds,
     exportMode,
@@ -87,119 +84,130 @@ export async function generateJobZip(options: ZipGeneratorOptions): Promise<void
   let completedTasks = 0;
   const targetExt = getFormatExtension(outputFormat);
 
-  // 1. PRE-RESIZE PRODUCTS ONCE PER JOB
-  onProgress?.(0, totalTasks, "Pre-processing product images...");
-  
-  const preparedProductsMap = new Map<string, PreparedProduct>();
-  const originalBuffersMap = new Map<string, Buffer>();
+  const passThrough = new PassThrough();
+  const archive = archiver("zip", { zlib: { level: 0 } }); // Zero-CPU store mode
 
-  for (const prod of products) {
-    if (prod.replaceBackground) {
-      const prepared = await prepareResizedProduct(prod.tempFilePath);
-      preparedProductsMap.set(prod.id, prepared);
+  archive.pipe(passThrough);
+
+  const promise = (async () => {
+    onProgress?.(0, totalTasks, "Pre-processing product images...");
+
+    const preparedProductsMap = new Map<string, PreparedProduct>();
+    const originalBuffersMap = new Map<string, Buffer>();
+
+    for (const prod of products) {
+      if (prod.replaceBackground) {
+        const prepared = await prepareResizedProduct(prod.tempFilePath);
+        preparedProductsMap.set(prod.id, prepared);
+      }
+      if (!prod.replaceBackground || exportMode === "background_wise") {
+        const buf = await fsPromises.readFile(prod.tempFilePath);
+        originalBuffersMap.set(prod.id, buf);
+      }
     }
-    if (!prod.replaceBackground || exportMode === "background_wise") {
-      const buf = await fsPromises.readFile(prod.tempFilePath);
-      originalBuffersMap.set(prod.id, buf);
-    }
-  }
 
-  // Create stream write target using Archiver level 0 (Store mode - Zero CPU wasted)
-  const outputStream = fs.createWriteStream(outputPath);
-  const archive = archiver("zip", { zlib: { level: 0 } });
+    const CONCURRENCY_BATCH_SIZE = 24;
 
-  const archivePromise = new Promise<void>((resolve, reject) => {
-    outputStream.on("close", () => resolve());
-    archive.on("error", (err) => reject(err));
-    outputStream.on("error", (err) => reject(err));
-  });
+    if (exportMode === "background_wise") {
+      for (const bg of backgrounds) {
+        const folderName = bg.name;
 
-  archive.pipe(outputStream);
+        await processInBatches(products, CONCURRENCY_BATCH_SIZE, async (prod) => {
+          const safeName = sanitizeFilename(prod.originalFilename);
+          const baseName = path.parse(safeName).name;
 
-  const CONCURRENCY_BATCH_SIZE = 24; // 24 parallel compositing workers
+          const zipEntryPath = prod.replaceBackground
+            ? `${folderName}/${baseName}${targetExt}`
+            : `${folderName}/${safeName}`;
 
-  if (exportMode === "background_wise") {
-    // --- MODE 1: Background-Wise Folders ---
-    for (const bg of backgrounds) {
-      const folderName = bg.name; // e.g. "color-0001"
+          if (prod.replaceBackground) {
+            const prepared = preparedProductsMap.get(prod.id)!;
+            const generatedBuffer = await compositeProductOnColorBackground(
+              prepared,
+              bg,
+              outputFormat
+            );
+            archive.append(generatedBuffer, { name: zipEntryPath });
+          } else {
+            const origBuf = originalBuffersMap.get(prod.id)!;
+            archive.append(origBuf, { name: zipEntryPath });
+          }
 
-      await processInBatches(products, CONCURRENCY_BATCH_SIZE, async (prod) => {
-        const safeName = sanitizeFilename(prod.originalFilename);
-        const baseName = path.parse(safeName).name;
-        
-        const zipEntryPath = prod.replaceBackground
-          ? `${folderName}/${baseName}${targetExt}`
-          : `${folderName}/${safeName}`;
+          completedTasks++;
+          onProgress?.(
+            completedTasks,
+            totalTasks,
+            `Processed ${prod.originalFilename} → ${folderName}`
+          );
+        });
+      }
+    } else {
+      const targetFolder = "Generated Images";
 
-        if (prod.replaceBackground) {
+      for (const prod of products) {
+        if (!prod.replaceBackground) {
+          const safeName = sanitizeFilename(prod.originalFilename);
+          const ext = path.extname(safeName);
+          const base = path.basename(safeName, ext);
+          const originalZipEntry = `${targetFolder}/${base}_original${ext || ".png"}`;
+
+          const origBuf = originalBuffersMap.get(prod.id)!;
+          archive.append(origBuf, { name: originalZipEntry });
+
+          completedTasks++;
+          onProgress?.(completedTasks, totalTasks, `Added ${originalZipEntry}`);
+        }
+      }
+
+      for (const bg of backgrounds) {
+        const bgBase = bg.name;
+        const enabledProducts = products.filter((p) => p.replaceBackground);
+
+        await processInBatches(enabledProducts, CONCURRENCY_BATCH_SIZE, async (prod) => {
+          const safeName = sanitizeFilename(prod.originalFilename);
+          const base = path.parse(safeName).name;
+
+          const imageFileName = `${base}_${bgBase}${targetExt}`;
+          const zipEntryPath = `${targetFolder}/${imageFileName}`;
+
           const prepared = preparedProductsMap.get(prod.id)!;
           const generatedBuffer = await compositeProductOnColorBackground(
             prepared,
             bg,
             outputFormat
           );
+
           archive.append(generatedBuffer, { name: zipEntryPath });
-        } else {
-          const origBuf = originalBuffersMap.get(prod.id)!;
-          archive.append(origBuf, { name: zipEntryPath });
-        }
 
-        completedTasks++;
-        onProgress?.(
-          completedTasks,
-          totalTasks,
-          `Processed ${prod.originalFilename} → ${folderName}`
-        );
-      });
-    }
-  } else {
-    // --- MODE 2: Single Generated Images Folder ---
-    const targetFolder = "Generated Images";
-
-    // 1. Add background-disabled products ONCE
-    for (const prod of products) {
-      if (!prod.replaceBackground) {
-        const safeName = sanitizeFilename(prod.originalFilename);
-        const ext = path.extname(safeName);
-        const base = path.basename(safeName, ext);
-        const originalZipEntry = `${targetFolder}/${base}_original${ext || ".png"}`;
-
-        const origBuf = originalBuffersMap.get(prod.id)!;
-        archive.append(origBuf, { name: originalZipEntry });
-
-        completedTasks++;
-        onProgress?.(completedTasks, totalTasks, `Added ${originalZipEntry}`);
+          completedTasks++;
+          onProgress?.(completedTasks, totalTasks, `Processed ${imageFileName}`);
+        });
       }
     }
 
-    // 2. Generate variations for background-enabled products in fast concurrent batches
-    for (const bg of backgrounds) {
-      const bgBase = bg.name;
-      const enabledProducts = products.filter((p) => p.replaceBackground);
+    await archive.finalize();
+  })();
 
-      await processInBatches(enabledProducts, CONCURRENCY_BATCH_SIZE, async (prod) => {
-        const safeName = sanitizeFilename(prod.originalFilename);
-        const base = path.parse(safeName).name;
+  return { stream: passThrough, promise };
+}
 
-        const imageFileName = `${base}_${bgBase}${targetExt}`;
-        const zipEntryPath = `${targetFolder}/${imageFileName}`;
-
-        const prepared = preparedProductsMap.get(prod.id)!;
-        const generatedBuffer = await compositeProductOnColorBackground(
-          prepared,
-          bg,
-          outputFormat
-        );
-
-        archive.append(generatedBuffer, { name: zipEntryPath });
-
-        completedTasks++;
-        onProgress?.(completedTasks, totalTasks, `Processed ${imageFileName}`);
-      });
-    }
+/**
+ * File-based ZIP generator for local filesystem runs.
+ */
+export async function generateJobZip(options: ZipGeneratorOptions): Promise<void> {
+  if (!options.outputPath) {
+    throw new Error("outputPath is required for generateJobZip");
   }
 
-  // Finalize archive stream
-  await archive.finalize();
-  await archivePromise;
+  const { stream, promise } = createJobZipStream(options);
+  const outputStream = fs.createWriteStream(options.outputPath);
+
+  const filePromise = new Promise<void>((resolve, reject) => {
+    outputStream.on("close", () => resolve());
+    outputStream.on("error", (err) => reject(err));
+    stream.on("error", (err) => reject(err));
+  });
+
+  stream.pipe(outputStream);
+  await Promise.all([promise, filePromise]);
 }
